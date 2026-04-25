@@ -1,0 +1,301 @@
+name: Grader
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      # ── Métrica: config_file_valid_schema ─────────────────────────────────
+      - name: Validate CI workflow schema
+        id: config_valid
+        run: |
+          if [ ! -f ".github/workflows/ci.yml" ] && [ ! -f ".github/workflows/ci.yaml" ]; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ .github/workflows/ci.yml not found"
+            exit 0
+          fi
+
+          TARGET=".github/workflows/ci.yml"
+          [ -f ".github/workflows/ci.yaml" ] && TARGET=".github/workflows/ci.yaml"
+
+          set +e
+          npx --yes @action-validator/cli "$TARGET" > validation-output.txt 2>&1
+          EXIT=$?
+          set -e
+
+          if [ "$EXIT" -eq 0 ]; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Workflow schema is valid"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Workflow schema validation failed:"
+            cat validation-output.txt
+          fi
+
+      # ── Métrica: ci_stages_present ────────────────────────────────────────
+      - name: Check required CI jobs
+        id: ci_stages_present
+        run: |
+          TARGET=".github/workflows/ci.yml"
+          [ -f ".github/workflows/ci.yaml" ] && TARGET=".github/workflows/ci.yaml"
+
+          if [ ! -f "$TARGET" ]; then
+            echo "score=0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ No CI workflow file found"
+            exit 0
+          fi
+
+          REQUIRED="lint test build scan deploy-staging"
+          FOUND=0
+          MISSING=""
+
+          for JOB in $REQUIRED; do
+            if grep -q "^  ${JOB}:" "$TARGET" || grep -q "^    ${JOB}:" "$TARGET" || grep -qE "^\s+${JOB}(\s|:)" "$TARGET"; then
+              FOUND=$((FOUND + 1))
+              echo "✅ Job '$JOB' found"
+            else
+              MISSING="$MISSING $JOB"
+              echo "❌ Job '$JOB' not found"
+            fi
+          done
+
+          echo "score=$FOUND" >> "$GITHUB_OUTPUT"
+          if [ "$FOUND" -eq 5 ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ All 5 required jobs present"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Missing jobs:$MISSING"
+          fi
+
+      # ── Métrica: ci_cache_configured ─────────────────────────────────────
+      - name: Check cache configuration
+        id: ci_cache_configured
+        run: |
+          TARGET=".github/workflows/ci.yml"
+          [ -f ".github/workflows/ci.yaml" ] && TARGET=".github/workflows/ci.yaml"
+
+          if [ ! -f "$TARGET" ]; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if grep -q "actions/cache" "$TARGET"; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ actions/cache found in CI workflow"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ actions/cache not found in CI workflow"
+          fi
+
+      # ── Métrica: test_coverage ────────────────────────────────────────────
+      - name: Run tests and measure coverage
+        id: test_coverage
+        run: |
+          set +e
+          npm test -- --coverageReporters=json-summary 2>&1
+          EXIT=$?
+          set -e
+
+          if [ ! -f "coverage/coverage-summary.json" ]; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Coverage summary not found"
+            exit 0
+          fi
+
+          COVERAGE=$(node -e "
+            const s = require('./coverage/coverage-summary.json');
+            const pct = s.total.lines.pct;
+            console.log(pct);
+          ")
+
+          echo "Coverage: ${COVERAGE}%"
+
+          SCORE=$(node -e "console.log(Math.min(1.0, $COVERAGE / 100).toFixed(2))")
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+
+          if node -e "process.exit($COVERAGE >= 70 ? 0 : 1)"; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Coverage ${COVERAGE}% ≥ 70%"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Coverage ${COVERAGE}% < 70%"
+          fi
+
+      # ── Métrica: commit_message_quality ───────────────────────────────────
+      - name: Check commit message quality
+        id: commit_quality
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE" ]; then
+            BASE="HEAD~10"
+          fi
+
+          COMMITS=$(git log "${BASE}..HEAD" --format="%s" 2>/dev/null || git log --format="%s" -10)
+          TOTAL=0
+          PASSING=0
+          PATTERN="^(feat|fix|docs|style|refactor|test|ci|chore|perf|build|revert)(\(.+\))?: .+"
+
+          while IFS= read -r MSG; do
+            [ -z "$MSG" ] && continue
+            TOTAL=$((TOTAL + 1))
+            if echo "$MSG" | grep -qE "$PATTERN"; then
+              PASSING=$((PASSING + 1))
+            else
+              echo "⚠️  Non-conventional: $MSG"
+            fi
+          done <<< "$COMMITS"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "score=null" >> "$GITHUB_OUTPUT"
+            echo "passed=null" >> "$GITHUB_OUTPUT"
+            echo "unavailable=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SCORE=$(node -e "console.log(($PASSING/$TOTAL).toFixed(2))")
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+          echo "unavailable=false" >> "$GITHUB_OUTPUT"
+
+          if node -e "process.exit($PASSING/$TOTAL >= 0.7 ? 0 : 1)"; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Conventional commits: $PASSING/$TOTAL ($(node -e "console.log(Math.round($PASSING/$TOTAL*100))")%)"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ Conventional commits: $PASSING/$TOTAL — need ≥ 70%"
+          fi
+
+      # ── Métrica: ci_pipeline_passes ───────────────────────────────────────
+      - name: Check student CI pipeline status
+        id: ci_passes
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          CHECKS=$(gh api \
+            "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
+            --jq '[.check_runs[] | select(.name != "grade")] | { total: length, passing: [.[] | select(.conclusion == "success")] | length }' \
+            2>/dev/null || echo '{"total":0,"passing":0}')
+
+          TOTAL=$(echo "$CHECKS" | node -e "console.log(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).total)")
+          PASSING=$(echo "$CHECKS" | node -e "console.log(JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).passing)")
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "score=null" >> "$GITHUB_OUTPUT"
+            echo "passed=null" >> "$GITHUB_OUTPUT"
+            echo "unavailable=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️  No CI check runs found yet"
+          elif [ "$TOTAL" -eq "$PASSING" ]; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "unavailable=false" >> "$GITHUB_OUTPUT"
+            echo "✅ All $TOTAL CI checks pass"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "unavailable=false" >> "$GITHUB_OUTPUT"
+            echo "❌ $PASSING/$TOTAL CI checks pass"
+          fi
+
+      # ── Reporte final ─────────────────────────────────────────────────────
+      - name: Build grader report
+        run: |
+          CI_SCORE="${{ steps.ci_passes.outputs.score }}"
+          CI_PASSED="${{ steps.ci_passes.outputs.passed }}"
+          CI_UNAVAILABLE="${{ steps.ci_passes.outputs.unavailable }}"
+          COMMIT_SCORE="${{ steps.commit_quality.outputs.score }}"
+          COMMIT_PASSED="${{ steps.commit_quality.outputs.passed }}"
+          COMMIT_UNAVAILABLE="${{ steps.commit_quality.outputs.unavailable }}"
+
+          [ -z "$CI_SCORE" ]            && CI_SCORE="null"
+          [ -z "$CI_PASSED" ]           && CI_PASSED="null"
+          [ -z "$CI_UNAVAILABLE" ]      && CI_UNAVAILABLE="true"
+          [ -z "$COMMIT_SCORE" ]        && COMMIT_SCORE="null"
+          [ -z "$COMMIT_PASSED" ]       && COMMIT_PASSED="null"
+          [ -z "$COMMIT_UNAVAILABLE" ]  && COMMIT_UNAVAILABLE="true"
+
+          cat > grader-report.json << EOF
+          {
+            "schemaVersion": "1.0",
+            "templateSlug": "gpi-ci-cd-github-actions",
+            "runId": "${{ github.run_id }}",
+            "sha": "${{ github.sha }}",
+            "metrics": [
+              {
+                "metricKey": "ci_pipeline_passes",
+                "score": $CI_SCORE,
+                "passed": $CI_PASSED,
+                "unavailable": $CI_UNAVAILABLE
+              },
+              {
+                "metricKey": "ci_stages_present",
+                "score": ${{ steps.ci_stages_present.outputs.score }},
+                "passed": ${{ steps.ci_stages_present.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "config_file_valid_schema",
+                "score": ${{ steps.config_valid.outputs.score }},
+                "passed": ${{ steps.config_valid.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "ci_cache_configured",
+                "score": ${{ steps.ci_cache_configured.outputs.score }},
+                "passed": ${{ steps.ci_cache_configured.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "test_coverage",
+                "score": ${{ steps.test_coverage.outputs.score }},
+                "passed": ${{ steps.test_coverage.outputs.passed }},
+                "unavailable": false
+              },
+              {
+                "metricKey": "commit_message_quality",
+                "score": $COMMIT_SCORE,
+                "passed": $COMMIT_PASSED,
+                "unavailable": $COMMIT_UNAVAILABLE
+              }
+            ]
+          }
+          EOF
+          cat grader-report.json
+
+      - name: Upload grader report
+        uses: actions/upload-artifact@v4
+        with:
+          name: grader-report
+          path: grader-report.json
